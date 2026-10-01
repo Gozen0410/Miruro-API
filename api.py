@@ -33,7 +33,11 @@ HEADERS = {
     "sec-ch-ua-platform": '"Windows"',
 }
 ANILIST_URL = "https://graphql.anilist.co"
-MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
+MIRURO_BASE_URLS = [
+    "https://www.miruro.tv",
+    "https://www.miruro.to",
+    "https://www.miruro.bz",
+]
 
 def _proxy_img(url: str) -> str:
     return url
@@ -73,14 +77,7 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "body": None,
         "version": "0.1.0",
     }
-    encoded_req = _encode_pipe_request(payload)
-    async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-        data = _decode_pipe_response(res.text.strip())
-        _deep_translate(data)
-        return data
+    return await _miruro_pipe_request(payload)
 
 MEDIA_LIST_FIELDS = """
     id
@@ -220,6 +217,43 @@ def _decode_pipe_response(encoded_str: str) -> dict:
 
 def _encode_pipe_request(payload: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
+
+async def _miruro_pipe_request(payload: dict) -> dict:
+    encoded_req = _encode_pipe_request(payload)
+    last_error = None
+
+    async with AsyncSession(impersonate="chrome110") as client:
+        for base_url in MIRURO_BASE_URLS:
+            request_headers = {
+                **HEADERS,
+                "Referer": f"{base_url}/",
+                "Origin": base_url,
+            }
+            try:
+                res = await client.get(
+                    f"{base_url}/api/secure/pipe?e={encoded_req}",
+                    headers=request_headers,
+                )
+                if res.status_code != 200:
+                    last_error = HTTPException(
+                        status_code=res.status_code,
+                        detail={
+                            "status": res.status_code,
+                            "body": res.text[:500],
+                            "headers": dict(res.headers),
+                        },
+                    )
+                    continue
+
+                data = _decode_pipe_response(res.text.strip())
+                _deep_translate(data)
+                return data
+            except Exception as exc:
+                last_error = exc
+
+    if isinstance(last_error, HTTPException):
+        raise last_error
+    raise HTTPException(status_code=503, detail="All Miruro domains failed")
 
 async def _anilist_query(query: str, variables: dict = None):
     body = {"query": query}
@@ -1010,12 +1044,9 @@ async def get_sources(
         "body": None,
         "version": "0.1.0",
     }
-    encoded_req = _encode_pipe_request(payload)
-    async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-        return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+    return _proxy_deep_images(
+        await _miruro_pipe_request(payload)
+    )
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
